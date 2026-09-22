@@ -1,289 +1,178 @@
-import { FormEvent, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import {
+  DndContext,
+  DragOverlay,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+  type DragStartEvent
+} from "@dnd-kit/core";
+import { useGate } from "./store/useGate";
+import { checkConsistency } from "./rules/occupancy";
+import { OrderPool } from "./components/OrderPool";
+import { GateBoard } from "./components/GateBoard";
+import { TripsPanel } from "./components/TripsPanel";
+import { Registry } from "./components/Registry";
+import { Toasts } from "./components/Toasts";
+import { DraggableOrder, type DragData } from "./components/DraggableOrder";
+import { OrderCardBody } from "./components/shared";
 
-type Field = {
-  key: string;
-  label: string;
-  type?: "number" | "date" | "select";
-  options?: string[];
-};
+function ConsistencyBar() {
+  const trips = useGate((s) => s.trips);
+  const drafts = useGate((s) => s.drafts);
+  const vehicles = useGate((s) => s.vehicles);
+  const drivers = useGate((s) => s.drivers);
+  const orders = useGate((s) => s.orders);
+  const hydratedAt = useGate((s) => s.hydratedAt);
 
-type RecordItem = {
-  id: string;
-  status: string;
-  notes: string;
-  createdAt: string;
-  [key: string]: string | number;
-};
+  const report = useMemo(
+    () =>
+      checkConsistency(
+        trips,
+        drafts,
+        new Map(vehicles.map((v) => [v.id, v])),
+        new Map(drivers.map((d) => [d.id, d])),
+        new Map(orders.map((o) => [o.id, o]))
+      ),
+    [trips, drafts, vehicles, drivers, orders]
+  );
 
-const project = {
-  "number": 14,
-  "folder": "hxwl/frontend/hxwlfront-14",
-  "framework": "react",
-  "title": "配送任务拖拽排班",
-  "subtitle": "把待分配订单安排给司机，并统计任务数和总重量。",
-  "industry": "物流",
-  "stack": [
-    "React",
-    "Vite",
-    "TypeScript",
-    "Ant Design",
-    "dnd-kit"
-  ],
-  "storageKey": "hxwlfront-14-schedule",
-  "formTitle": "新增待分配订单",
-  "primaryAction": "加入待分配",
-  "entityLabel": "订单",
-  "statuses": [
-    "待分配",
-    "已分配",
-    "已完成"
-  ],
-  "filters": [
-    "全部司机",
-    "刘师傅",
-    "赵师傅",
-    "孙师傅"
-  ],
-  "fields": [
-    {
-      "key": "orderNo",
-      "label": "订单号"
-    },
-    {
-      "key": "driver",
-      "label": "司机",
-      "type": "select",
-      "options": [
-        "刘师傅",
-        "赵师傅",
-        "孙师傅"
-      ]
-    },
-    {
-      "key": "weight",
-      "label": "重量kg",
-      "type": "number"
-    },
-    {
-      "key": "destination",
-      "label": "目的地"
-    }
-  ],
-  "records": [
-    {
-      "orderNo": "ORD-9012",
-      "driver": "刘师傅",
-      "weight": 260,
-      "destination": "浦东",
-      "status": "已分配",
-      "notes": "上午配送"
-    },
-    {
-      "orderNo": "ORD-9031",
-      "driver": "赵师傅",
-      "weight": 140,
-      "destination": "嘉定",
-      "status": "待分配",
-      "notes": "待排班"
-    }
-  ],
-  "metricLabels": [
-    "订单数",
-    "已分配",
-    "总重量"
-  ]
-} as const;
-
-const fields = project.fields as unknown as Field[];
-const statuses: string[] = [...project.statuses];
-
-function createBlank() {
-  return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
+  return (
+    <footer className="consistency">
+      <span className={`cons-dot ${report.ok ? "ok" : "bad"}`} />
+      {report.ok ? (
+        <span>
+          刷新一致性校验通过：车辆占用由 {report.tripCount} 个车次版本链（含 {report.pendingCount} 个待生效改派）与 {report.draftCount} 条车道统一推导 · 本页数据加载于 {new Date(hydratedAt).toLocaleString("zh-CN")}
+        </span>
+      ) : (
+        <span>一致性异常：{report.issues.join("；")}</span>
+      )}
+    </footer>
+  );
 }
 
-function loadRecords(): RecordItem[] {
-  const raw = localStorage.getItem(project.storageKey);
-  if (!raw) {
-    return project.records.map((record, index) => ({
-      ...record,
-      id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
-    })) as RecordItem[];
+function Metrics() {
+  const orders = useGate((s) => s.orders);
+  const trips = useGate((s) => s.trips);
+  const drafts = useGate((s) => s.drafts);
+  const drivers = useGate((s) => s.drivers);
+  const vehicles = useGate((s) => s.vehicles);
+
+  const assigned = new Set<string>();
+  for (const trip of trips) {
+    trip.versions[trip.versions.length - 1].stops.forEach((s) => assigned.add(s.orderId));
+    trip.pendingRevision?.stops.forEach((s) => assigned.add(s.orderId));
   }
-  try {
-    return JSON.parse(raw) as RecordItem[];
-  } catch {
-    return [];
-  }
-}
+  drafts.forEach((d) => d.stops.forEach((s) => assigned.add(s.orderId)));
+  const pendingCount = orders.length - assigned.size;
+  const expiredDrivers = drivers.filter((d) =>
+    Object.values(d.certExpiries).some((expiry) => new Date(`${expiry}T23:59:59`).getTime() < Date.now())
+  ).length;
 
-function saveRecords(records: RecordItem[]) {
-  localStorage.setItem(project.storageKey, JSON.stringify(records));
-}
+  const items = [
+    { label: "待分配订单", value: pendingCount },
+    { label: "在途/完成车次", value: trips.length },
+    { label: "待生效改派", value: trips.filter((t) => t.pendingRevision).length },
+    { label: "证照过期司机", value: expiredDrivers, danger: expiredDrivers > 0 },
+    { label: "车辆车道", value: vehicles.length }
+  ];
 
-function nextStatus(status: string) {
-  const index = statuses.indexOf(status);
-  return statuses[(index + 1) % statuses.length];
-}
-
-function primaryText(record: RecordItem) {
-  const first = fields[0];
-  const second = fields[1];
-  return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
+  return (
+    <section className="metrics">
+      {items.map((item) => (
+        <article className={`metric${item.danger ? " metric-danger" : ""}`} key={item.label}>
+          <span>{item.label}</span>
+          <strong>{item.value}</strong>
+        </article>
+      ))}
+    </section>
+  );
 }
 
 export default function App() {
-  const [records, setRecords] = useState<RecordItem[]>(loadRecords);
-  const [form, setForm] = useState<Record<string, string | number>>(createBlank);
-  const [note, setNote] = useState("");
-  const [filter, setFilter] = useState<string>(project.filters[0]);
+  const orders = useGate((s) => s.orders);
+  const materialize = useGate((s) => s.materializeDueRevisions);
+  const addOrderToDraft = useGate((s) => s.addOrderToDraft);
+  const moveStop = useGate((s) => s.moveStopBetweenDrafts);
+  const resetDemo = useGate((s) => s.resetDemo);
+  const [activeId, setActiveId] = useState<string | null>(null);
 
-  const filteredRecords = useMemo(() => {
-    if (filter.startsWith("全部")) return records;
-    return records.filter((record) => Object.values(record).includes(filter));
-  }, [filter, records]);
+  // 每秒检查待生效改派是否到点：到点即物化新版本、释放原占用
+  useEffect(() => {
+    materialize();
+    const timer = window.setInterval(materialize, 1000);
+    return () => window.clearInterval(timer);
+  }, [materialize]);
 
-  const metrics = useMemo(() => {
-    const total = records.length;
-    const second = records.filter((record) => record.status === statuses[1]).length;
-    const third = records.filter((record) => record.status === statuses[2]).length;
-    const numberValues = records.flatMap((record) =>
-      fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
-    );
-    const sum = numberValues.reduce((acc, value) => acc + value, 0);
-    return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
-  }, [records]);
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
 
-  const chartRows = statuses.map((status) => ({
-    status,
-    value: records.filter((record) => record.status === status).length
-  }));
-  const maxChart = Math.max(1, ...chartRows.map((row) => row.value));
+  const activeOrder = useMemo(() => {
+    if (!activeId) return null;
+    const match = activeId.match(/^(?:pool|stop:[^:]+):(.+)$/);
+    if (!match) return null;
+    return orders.find((o) => o.id === match[1]) ?? null;
+  }, [activeId, orders]);
 
-  function updateRecords(next: RecordItem[]) {
-    setRecords(next);
-    saveRecords(next);
+  function onDragStart(event: DragStartEvent) {
+    setActiveId(String(event.active.id));
   }
 
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const next: RecordItem = {
-      ...form,
-      id: crypto.randomUUID(),
-      status: statuses[0],
-      notes: note || "暂无备注",
-      createdAt: new Date().toISOString()
-    } as RecordItem;
-    updateRecords([next, ...records]);
-    setForm(createBlank());
-    setNote("");
+  function onDragEnd(event: DragEndEvent) {
+    setActiveId(null);
+    const data = event.active.data.current as DragData | undefined;
+    const overId = event.over ? String(event.over.id) : null;
+    if (!data || !overId || !overId.startsWith("lane:")) return;
+    const targetVehicle = overId.slice("lane:".length);
+    if (data.from) {
+      moveStop(data.from, targetVehicle, data.orderId);
+    } else {
+      addOrderToDraft(targetVehicle, data.orderId);
+    }
   }
 
   return (
-    <main className="app">
-      <div className="shell">
-        <header className="topbar">
-          <div>
-            <p className="eyebrow">{project.industry}行业前端最小闭环</p>
-            <h1>{project.title}</h1>
-            <p className="subtitle">{project.subtitle}</p>
-          </div>
-          <div className="stack">{project.stack.map((item) => <span className="tag" key={item}>{item}</span>)}</div>
-        </header>
+    <DndContext sensors={sensors} onDragStart={onDragStart} onDragEnd={onDragEnd} onDragCancel={() => setActiveId(null)}>
+      <main className="app">
+        <div className="shell">
+          <header className="topbar">
+            <div>
+              <p className="eyebrow">物流 · 车辆通行证准入台</p>
+              <h1>配送排班 × 通行证准入</h1>
+              <p className="subtitle">
+                订单拖入车道即校验：证照有效期与准驾、核载重、温层、通行证目的地区域、车辆与司机时段重叠——任一不过整单拒绝。
+                发车后锁定司机/车辆/顺序；改派必须写原因并生成新版本，原占用保留到修订生效才释放。
+              </p>
+            </div>
+            <div className="top-actions">
+              <div className="stack">
+                {["React", "TypeScript", "dnd-kit", "zustand", "数据/规则/界面分层"].map((item) => (
+                  <span className="tag" key={item}>{item}</span>
+                ))}
+              </div>
+              <button type="button" className="secondary reset-btn" onClick={resetDemo}>重置演示数据</button>
+            </div>
+          </header>
 
-        <section className="metrics">
-          {project.metricLabels.map((label, index) => (
-            <article className="metric" key={label}>
-              <span>{label}</span>
-              <strong>{metrics[index]}</strong>
+          <Metrics />
+          <OrderPool />
+          <GateBoard />
+          <TripsPanel />
+          <Registry />
+          <ConsistencyBar />
+        </div>
+      </main>
+
+      <DragOverlay dropAnimation={null}>
+        {activeOrder ? (
+          <div className="drag-overlay-card">
+            <article className="order-card">
+              <OrderCardBody order={activeOrder} compact />
             </article>
-          ))}
-        </section>
-
-        <section className="workspace">
-          <form className="panel" onSubmit={handleSubmit}>
-            <h2>{project.formTitle}</h2>
-            <div className="form-grid">
-              {fields.map((field) => (
-                <label key={field.key}>
-                  {field.label}
-                  {field.type === "select" ? (
-                    <select
-                      value={String(form[field.key])}
-                      onChange={(event) => setForm({ ...form, [field.key]: event.target.value })}
-                      required
-                    >
-                      <option value="">请选择</option>
-                      {field.options?.map((option) => <option key={option}>{option}</option>)}
-                    </select>
-                  ) : (
-                    <input
-                      type={field.type || "text"}
-                      value={form[field.key]}
-                      onChange={(event) =>
-                        setForm({ ...form, [field.key]: field.type === "number" ? Number(event.target.value) : event.target.value })
-                      }
-                      required
-                    />
-                  )}
-                </label>
-              ))}
-              <label>
-                备注
-                <textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="填写处理说明或现场备注" />
-              </label>
-              <button type="submit">{project.primaryAction}</button>
-            </div>
-          </form>
-
-          <section className="list-panel">
-            <div className="toolbar">
-              <h2>{project.entityLabel}列表</h2>
-              <select value={filter} onChange={(event) => setFilter(event.target.value)}>
-                {project.filters.map((item) => <option key={item}>{item}</option>)}
-              </select>
-            </div>
-
-            <div className="record-grid">
-              {filteredRecords.length === 0 ? <div className="empty">暂无匹配数据</div> : filteredRecords.map((record) => (
-                <article className="record" key={record.id}>
-                  <div className="record-head">
-                    <p className="record-title">{primaryText(record)}</p>
-                    <span className="status">{record.status}</span>
-                  </div>
-                  <div className="details">
-                    {fields.map((field) => (
-                      <span key={field.key}>{field.label}: {record[field.key]}</span>
-                    ))}
-                  </div>
-                  <p className="note">{record.notes}</p>
-                  <div className="actions">
-                    <button type="button" onClick={() => updateRecords(records.map((item) => item.id === record.id ? { ...item, status: nextStatus(item.status) } : item))}>
-                      流转状态
-                    </button>
-                    <button className="secondary" type="button" onClick={() => navigator.clipboard?.writeText(primaryText(record))}>
-                      复制摘要
-                    </button>
-                    <button className="danger" type="button" onClick={() => updateRecords(records.filter((item) => item.id !== record.id))}>
-                      删除
-                    </button>
-                  </div>
-                </article>
-              ))}
-            </div>
-
-            <div className="mini-chart">
-              {chartRows.map((row) => (
-                <div className="bar" key={row.status}>
-                  <span>{row.status}</span>
-                  <div className="bar-track"><div className="bar-fill" style={{ width: `${(row.value / maxChart) * 100}%` }} /></div>
-                  <strong>{row.value}</strong>
-                </div>
-              ))}
-            </div>
-          </section>
-        </section>
-      </div>
-    </main>
+          </div>
+        ) : null}
+      </DragOverlay>
+      <Toasts />
+    </DndContext>
   );
 }
